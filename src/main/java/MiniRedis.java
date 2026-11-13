@@ -1,68 +1,201 @@
-import java.io.*;
-import java.net.ServerSocket;
-import java.net.Socket;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 
 /**
- * Mini Redis, layer 1: TCP server + RESP parser + SET/GET/DEL.
+ * 
+ *
+ * One thread watches ALL connections with a Selector and handles whichever
+ * socket is ready. Because only that thread touches the store, no locks are
+ * needed, and commands run one at a time in the order they arrive.
+ *
  * Run with:  java MiniRedis.java [port]     (Java 17+)
  * Test with: redis-cli -p 6379
- * installing redis-cli  curl -fsSL https://packages.redis.io/redis-cli/install.sh | sh
  */
 public class MiniRedis {
-
     public static void main(String[] args) throws IOException {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 6379;
-        Store store = new MapStore();
-        CommandHandler handler = new CommandHandler(store);
+        new EventLoopServer(port, new CommandHandler(new MapStore())).run();
+    }
+}
 
-        try (ServerSocket server = new ServerSocket(port)) {
-            System.out.println("MiniRedis listening on port " + port);
+/** The event loop: accept, read, parse, execute, write, all on one thread. */
+class EventLoopServer {
+    private final int port;
+    private final CommandHandler handler;
+
+    EventLoopServer(int port, CommandHandler handler) {
+        this.port = port;
+        this.handler = handler;
+    }
+
+    void run() throws IOException {
+        try (Selector selector = Selector.open();
+             ServerSocketChannel server = ServerSocketChannel.open()) {
+
+            server.bind(new InetSocketAddress(port));
+            server.configureBlocking(false);
+            server.register(selector, SelectionKey.OP_ACCEPT);
+            System.out.println("MiniRedis (event loop) listening on port " + port);
+
             while (true) {
-                Socket socket = server.accept();
-                // Layer 1: one thread per connection. Revisit in layer 2.
-                new Thread(() -> serve(socket, handler)).start();
+                selector.select();   // sleeps until at least one socket is ready
+                Iterator<SelectionKey> ready = selector.selectedKeys().iterator();
+                while (ready.hasNext()) {
+                    SelectionKey key = ready.next();
+                    ready.remove();
+                    try {
+                        if (!key.isValid()) continue;
+                        if (key.isAcceptable()) {
+                            accept(server, selector);
+                            continue;
+                        }
+                        if (key.isReadable()) onReadable(key);
+                        if (key.isValid() && key.isWritable()) onWritable(key);
+                    } catch (IOException | RuntimeException e) {
+                        close(key);   // one bad client must never stop the loop
+                    }
+                }
             }
         }
     }
 
-    private static void serve(Socket socket, CommandHandler handler) {
-        try (socket;
-             InputStream in = new BufferedInputStream(socket.getInputStream());
-             OutputStream out = new BufferedOutputStream(socket.getOutputStream())) {
+    private void accept(ServerSocketChannel server, Selector selector) throws IOException {
+        SocketChannel channel = server.accept();
+        if (channel == null) return;
+        channel.configureBlocking(false);
+        channel.setOption(StandardSocketOptions.TCP_NODELAY, true);
+        channel.register(selector, SelectionKey.OP_READ, new Connection());
+    }
 
-            RespParser parser = new RespParser(in);
+    private void onReadable(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+        Connection conn = (Connection) key.attachment();
+
+        try {
+            conn.ensureReadSpace();
+        } catch (IllegalArgumentException e) {
+            protocolError(key, channel, e);
+            return;
+        }
+
+        int n = channel.read(conn.in);
+        if (n == -1) {          // client disconnected
+            close(key);
+            return;
+        }
+
+        // Parse every complete command now sitting in the buffer. This handles
+        // pipelining (many commands in one read). A half-received command is
+        // left in the buffer until the rest of its bytes arrive.
+        conn.in.flip();
+        try {
             List<String> command;
-            while ((command = parser.readCommand()) != null) {
-                out.write(handler.execute(command));
-                out.flush();
+            while ((command = RespParser.tryParse(conn.in)) != null) {
+                conn.out.add(ByteBuffer.wrap(handler.execute(command)));
             }
-        } catch (Exception e) {
-            System.err.println("Connection closed: " + e.getMessage());
+        } catch (IllegalArgumentException e) {
+            protocolError(key, channel, e);
+            return;
+        }
+        conn.in.compact();      // keep unparsed leftovers, make room for more
+
+        flush(key, channel, conn);
+    }
+
+    private void onWritable(SelectionKey key) throws IOException {
+        flush(key, (SocketChannel) key.channel(), (Connection) key.attachment());
+    }
+
+    /**
+     * Writes as much pending output as the socket accepts. If the socket's send
+     * buffer is full, stop reading from this client (backpressure) and wait for
+     * OP_WRITE instead of letting replies pile up in memory.
+     */
+    private void flush(SelectionKey key, SocketChannel channel, Connection conn) throws IOException {
+        while (!conn.out.isEmpty()) {
+            ByteBuffer head = conn.out.peekFirst();
+            channel.write(head);
+            if (head.hasRemaining()) {
+                key.interestOps(SelectionKey.OP_WRITE);
+                return;
+            }
+            conn.out.pollFirst();
+        }
+        key.interestOps(SelectionKey.OP_READ);
+    }
+
+    private void protocolError(SelectionKey key, SocketChannel channel, IllegalArgumentException e) {
+        try {
+            channel.write(ByteBuffer.wrap(Resp.error("ERR " + e.getMessage())));
+        } catch (IOException ignored) {
+            // best effort: we're closing anyway
+        }
+        close(key);
+    }
+
+    private void close(SelectionKey key) {
+        key.cancel();
+        try {
+            key.channel().close();
+        } catch (IOException ignored) {
+            // nothing more to do
         }
     }
 }
 
+/** Per-client state: bytes received but not yet parsed, and replies not yet sent. */
+class Connection {
+    private static final int INITIAL_SIZE = 4096;
+    private static final int MAX_SIZE = 64 * 1024 * 1024;   // per-client input cap
 
+    /** Kept in "write mode" between events: position = how many bytes we hold. */
+    ByteBuffer in = ByteBuffer.allocate(INITIAL_SIZE);
+    final Deque<ByteBuffer> out = new ArrayDeque<>();
+
+    /** Double the buffer when a single command is bigger than it. */
+    void ensureReadSpace() {
+        if (in.hasRemaining()) return;
+        if (in.capacity() >= MAX_SIZE) {
+            throw new IllegalArgumentException("Protocol error: command too large");
+        }
+        ByteBuffer bigger = ByteBuffer.allocate(in.capacity() * 2);
+        in.flip();
+        bigger.put(in);
+        in = bigger;
+    }
+}
+
+/** Storage interface, so later layers (expiry, LRU) can plug in. */
 interface Store {
     void set(String key, String value);
     String get(String key);          // null if missing
     boolean delete(String key);      // true if the key existed
 }
 
-/** Layer 1 store: a plain hash map. */
+/** A plain HashMap is enough: only the event-loop thread ever touches it. */
 class MapStore implements Store {
-    private final ConcurrentHashMap<String, String> map = new ConcurrentHashMap<>();
+    private final Map<String, String> map = new HashMap<>();
 
     public void set(String key, String value) { map.put(key, value); }
     public String get(String key) { return map.get(key); }
     public boolean delete(String key) { return map.remove(key) != null; }
 }
 
-/** Turns a parsed command into a RESP reply. */
+/** Turns a parsed command into a RESP reply. (Unchanged from layer 1.) */
 class CommandHandler {
     private final Store store;
 
@@ -100,62 +233,84 @@ class CommandHandler {
 }
 
 /**
- * Reads one RESP array of bulk strings per call, e.g.
- * *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+ * Incremental RESP parser. Unlike layer 1 it never blocks: if the buffer does
+ * not yet hold a whole command it returns null and leaves the buffer untouched,
+ * so the caller can try again after more bytes arrive.
  *
- * Partial reads: InputStream.read / readNBytes block until the bytes arrive,
- * so a command split across several TCP packets is handled naturally here.
- * (An event loop in a later layer would need an explicit buffer instead.)
+ * Expects: *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
  */
-class RespParser {
-    private final InputStream in;
+final class RespParser {
+    private static final int MAX_ARGS = 1_048_576;
+    private static final int MAX_BULK = 32 * 1024 * 1024;
+    private static final int MAX_LINE = 1024;
 
-    RespParser(InputStream in) { this.in = in; }
+    private RespParser() {}
 
-    /** Returns null when the client disconnects cleanly between commands. */
-    List<String> readCommand() throws IOException {
-        String header = readLine();
+    /**
+     * @param buf a buffer in read mode (flipped)
+     * @return one command and the buffer advanced past it, or null if incomplete
+     * @throws IllegalArgumentException on malformed input
+     */
+    static List<String> tryParse(ByteBuffer buf) {
+        int start = buf.position();
+        List<String> command = parseArray(buf);
+        if (command == null) buf.position(start);   // incomplete: rewind
+        return command;
+    }
+
+    private static List<String> parseArray(ByteBuffer buf) {
+        String header = readLine(buf);
         if (header == null) return null;
         if (!header.startsWith("*")) {
-            throw new IOException("Protocol error: expected '*' but got: " + header);
+            throw new IllegalArgumentException("Protocol error: expected '*'");
         }
 
         int count = Integer.parseInt(header.substring(1));
-        List<String> args = new ArrayList<>(count);
+        if (count > MAX_ARGS) throw new IllegalArgumentException("Protocol error: too many arguments");
+        List<String> args = new ArrayList<>(Math.max(0, Math.min(count, 16)));
 
         for (int i = 0; i < count; i++) {
-            String lengthLine = readLine();
-            if (lengthLine == null || !lengthLine.startsWith("$")) {
-                throw new IOException("Protocol error: expected '$'");
+            String lengthLine = readLine(buf);
+            if (lengthLine == null) return null;
+            if (!lengthLine.startsWith("$")) {
+                throw new IllegalArgumentException("Protocol error: expected '$'");
             }
             int length = Integer.parseInt(lengthLine.substring(1));
+            if (length < 0 || length > MAX_BULK) {
+                throw new IllegalArgumentException("Protocol error: invalid bulk length");
+            }
 
-            byte[] data = in.readNBytes(length);
-            if (data.length < length) throw new EOFException("Client closed mid-command");
-            if (in.read() != '\r' || in.read() != '\n') {
-                throw new IOException("Protocol error: missing CRLF after bulk string");
+            if (buf.remaining() < length + 2) return null;   // data + CRLF not all here yet
+            byte[] data = new byte[length];
+            buf.get(data);
+            if (buf.get() != '\r' || buf.get() != '\n') {
+                throw new IllegalArgumentException("Protocol error: missing CRLF after bulk string");
             }
             args.add(new String(data, StandardCharsets.UTF_8));
         }
         return args;
     }
 
-    private String readLine() throws IOException {
-        ByteArrayOutputStream buf = new ByteArrayOutputStream();
-        int b;
-        while ((b = in.read()) != -1) {
-            if (b == '\r') {
-                if (in.read() != '\n') throw new IOException("Protocol error: expected LF");
-                return buf.toString(StandardCharsets.UTF_8);
+    /** Returns one CRLF-terminated line (without the CRLF), or null if none is complete yet. */
+    private static String readLine(ByteBuffer buf) {
+        int pos = buf.position();
+        int limit = buf.limit();
+        for (int i = pos; i + 1 < limit; i++) {
+            if (buf.get(i) == '\r' && buf.get(i + 1) == '\n') {
+                byte[] bytes = new byte[i - pos];
+                buf.get(bytes);
+                buf.position(i + 2);
+                return new String(bytes, StandardCharsets.UTF_8);
             }
-            buf.write(b);
         }
-        if (buf.size() == 0) return null;   // clean disconnect
-        throw new EOFException("Client closed mid-line");
+        if (limit - pos > MAX_LINE) {
+            throw new IllegalArgumentException("Protocol error: line too long");
+        }
+        return null;
     }
 }
 
-/** RESP reply encoders. */
+/* RESP reply encoders.  */
 final class Resp {
     private Resp() {}
 
