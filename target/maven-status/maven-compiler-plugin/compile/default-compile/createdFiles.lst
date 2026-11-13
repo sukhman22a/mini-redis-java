@@ -1,6 +1,8 @@
-Resp.class
-Store.class
-MapStore.class
-CommandHandler.class
-RespParser.class
-MiniRedis.class
+MiniRedis/CommandHandler.class
+MiniRedis/Store.class
+MiniRedis/EventLoopServer.class
+MiniRedis/MiniRedis.class
+MiniRedis/RespParser.class
+MiniRedis/MapStore.class
+MiniRedis/Connection.class
+MiniRedis/Resp.class

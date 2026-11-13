@@ -1,3 +1,4 @@
+package MiniRedis;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
@@ -16,7 +17,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 
+ * Mini Redis, layer 2: a single-threaded event loop (like real Redis).
  *
  * One thread watches ALL connections with a Selector and handles whichever
  * socket is ready. Because only that thread touches the store, no locks are
@@ -244,7 +245,7 @@ final class RespParser {
     private static final int MAX_BULK = 32 * 1024 * 1024;
     private static final int MAX_LINE = 1024;
 
-    private RespParser() {}
+    // private RespParser() {}
 
     /**
      * @param buf a buffer in read mode (flipped)
@@ -310,7 +311,7 @@ final class RespParser {
     }
 }
 
-/* RESP reply encoders.  */
+/** RESP reply encoders. (Unchanged from layer 1.) */
 final class Resp {
     private Resp() {}
 

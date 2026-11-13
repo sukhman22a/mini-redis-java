@@ -1,2 +1,2 @@
-RespParserTest.class
-CommandHandlerTest.class
+MiniRedis/RespParserTest.class
+MiniRedis/CommandHandlerTest.class
